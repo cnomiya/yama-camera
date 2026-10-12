@@ -107,6 +107,14 @@ button { cursor: pointer; }
 .st.hidden { color: var(--bad); background: rgba(239,138,128,.12); }
 canvas.profile { width: 100%; height: 170px; display: block; background: var(--ink); border-radius: 10px; }
 #map { width: 100%; height: 220px; border-radius: 10px; overflow: hidden; background: var(--ink-3); }
+#map.map-lg { height: 300px; }
+.where { font-size: 14px; line-height: 1.7; margin: 0 0 8px; }
+.where strong { color: var(--alpen); font-weight: 700; }
+.north { background: rgba(255,255,255,.92); color: #222; border-radius: 6px; padding: 2px 7px 3px; font: 700 11px/1.1 var(--font-ui); text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+.north span { display: block; font-size: 12px; }
+.leaflet-tooltip.tip-peak { font: 700 12px/1.4 var(--font-ui); color: #1a120b; }
+.leaflet-tooltip.tip-me { font: 600 11px/1.3 var(--font-ui); color: #0b2a5a; }
+.tip-sub { font-weight: 500; color: #555; margin-left: 4px; }
 .cond { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12px; color: var(--mist); }
 .cond dt { color: var(--mist); } .cond dd { margin: 0; color: var(--snow); min-width: 0; overflow-wrap: anywhere; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -167,10 +175,11 @@ canvas.profile { width: 100%; height: 170px; display: block; background: var(--i
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 5l-7 7 7 7"/></svg>
       </button>
       <button id="btnPhoto2" class="icon-btn" type="button">写真</button>
+      <button id="btnMap" class="icon-btn" type="button">地図</button>
     </div>
     <button id="btnShutter" class="shutter" type="button" aria-label="この景色で調べる"></button>
     <div class="right">
-      <button id="btnAlign" class="icon-btn" type="button">自動で合わせる</button>
+      <button id="btnAlign" class="icon-btn" type="button">自動合わせ</button>
       <button id="btnReset" class="icon-btn" type="button" aria-label="合わせを元に戻す">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12a8 8 0 1 0 3-6.2"/><path d="M4 4v5h5"/></svg>
       </button>
@@ -309,6 +318,7 @@ function rayContext(dem, obs, maxD) {
 function marchRay(dem, obs, ctx, azDeg, limitD, cb) {
   const th = azDeg * D2R, st = Math.sin(th), ct = Math.cos(th);
   const { ds, n, sinD, cosD, drop, tier, sp1, cp1, l1 } = ctx;
+  let missing = 0, total = 0;
   for (let k = 0; k < n; k++) {
     const d = ds[k];
     if (d > limitD) break;
@@ -316,10 +326,12 @@ function marchRay(dem, obs, ctx, azDeg, limitD, cb) {
     const lat = Math.asin(sp2) * R2D;
     const lon = (l1 + Math.atan2(st * sinD[k] * cp1, cosD[k] - sp1 * sp2)) * R2D;
     const h = dem.sampleTier(lat, lon, tier[k]);
-    if (h !== h) continue;
+    total++;
+    if (h !== h) { missing++; continue; }
     const a = Math.atan2(h - obs.h - drop[k], d);
     if (cb(k, d, lat, lon, h, a) === false) break;
   }
+  return { missing, total };   // 標高データが欠けていた点の数
 }
 
 /* ---------- 360°パノラマ(稜線)の計算 ---------- */
@@ -374,7 +386,8 @@ function analyzePeak(dem, obs, ctx, peak) {
   // 山頂自身の斜面(山頂から手前へ続く高い部分)は遮蔽物として数えない。
   // なだらかな山では、山頂より手前の肩が見かけ上わずかに高く見えるため。
   const pts = [];
-  marchRay(dem, obs, ctx, az, d - 30, (k, dd, lat, lon, h, a) => { pts.push(dd, h, a, lat, lon); });
+  const cov = marchRay(dem, obs, ctx, az, d - 30, (k, dd, lat, lon, h, a) => { pts.push(dd, h, a, lat, lon); });
+  const missingRatio = cov.total ? cov.missing / cov.total : 1;
   const thr = Math.max(80, 0.12 * (hp - obs.h));
   let cut = pts.length;
   while (cut >= 5 && pts[cut - 4] >= hp - thr) cut -= 5;
@@ -388,11 +401,31 @@ function analyzePeak(dem, obs, ctx, peak) {
   const tolH = 12 + d * 0.0003;
   const tol = Math.atan(tolH / d);
   const margin = fg === -Infinity ? Infinity : el - fg;
-  const status = margin > tol ? 'visible' : (margin < -tol ? 'hidden' : 'marginal');
+  let status = margin > tol ? 'visible' : (margin < -tol ? 'hidden' : 'marginal');
+  // 途中の標高データが欠けていると遮る地形を見落とすため、判定できないものとして扱う
+  if (missingRatio > 0.03 && status !== 'hidden') status = 'unknown';
   return {
-    peak, d, az, el, ele: hp, eleSrc, status, margin, tol,
+    peak, d, az, el, ele: hp, eleSrc, status, margin, tol, missingRatio,
     blocker: fg === -Infinity ? null : { d: fgD, h: fgH, el: fg, lat: fgLat, lon: fgLon },
   };
+}
+
+/* 山頂が「見える輪郭」の上にあるか(空との境目、または手前の尾根に重なる奥の尾根の輪郭)。
+   輪郭上にない山頂は、斜面の途中にあって見分けにくい */
+function onOutline(pano, a) {
+  const tolEl = Math.max(0.12 * D2R, Math.atan(25 / a.d));
+  const sky = skyAt(pano, a.az);
+  if (a.el >= sky - tolEl) return 'sky';
+  const R = pano.ridges;
+  if (!R) return null;
+  const i0 = Math.round(normAz(a.az) / pano.azStep);
+  for (let di = -2; di <= 2; di++) {
+    const i = ((i0 + di) % pano.n + pano.n) % pano.n;
+    for (let k = R.start[i]; k < R.start[i + 1]; k++) {
+      if (Math.abs(R.el[k] - a.el) <= tolEl && Math.abs(R.d[k] - a.d) <= Math.max(1500, a.d * 0.12)) return 'ridge';
+    }
+  }
+  return null;
 }
 
 /* 指定方向で実際に見えている地形の点(その方向の視線が最初に地面に当たる点) */
@@ -433,6 +466,8 @@ function rankCandidates(analyzed, tapAz, tapElDeg, sAz, sEl) {
     let score = z;
     if (p.status === 'hidden') score += 100;
     else if (p.status === 'marginal') score += 0.5;
+    // 稜線・尾根の輪郭上にない山頂(斜面の途中の地点)は、指した山である可能性を下げる
+    if (p.outline === null) score += 1.5;
     list.push({ p, dAz, dEl, ang, z, score });
   }
   list.sort((a, b) => a.score - b.score);
@@ -444,7 +479,7 @@ function judge(ranked) {
   if (!vis.length) return { level: 'none', top: null };
   const top = vis[0], second = vis[1];
   if (top.z > 3) return { level: 'none', top };
-  const sep = second ? second.z - top.z : Infinity;
+  const sep = second ? second.score - top.score : Infinity;
   if (top.z <= 1.5 && sep >= 1.5 && top.p.status === 'visible') return { level: 'high', top, second, sep };
   if (top.z <= 2.5 && sep >= 0.7) return { level: 'mid', top, second, sep };
   return { level: 'low', top, second, sep };
@@ -686,7 +721,7 @@ function readTiff(v, t) {
 const Core = {
   R_EARTH, REFRACTION_K, D2R, R2D, normAz, angDiff, distBearing, destination, curvatureDrop, apparentElev,
   lonToPx, latToPx, tilesForRadius, decodeGSI, decodeTerrarium, DEM, makeSteps, rayContext, marchRay,
-  createPanorama, computePanoramaRange, skyAt, analyzePeak, terrainAt, profile, rankCandidates, judge, indexRidges,
+  createPanorama, computePanoramaRange, skyAt, onOutline, analyzePeak, terrainAt, profile, rankCandidates, judge, indexRidges,
   makeCamera, cameraTiltFromOrientation, focalPxFrom35mm, focalPxFromFov, declinationJP,
   buildEdgeField, predictSkylineColumns, alignCost, autoAlign, parseExif,
 };
@@ -838,6 +873,8 @@ async function prepare(pos) {
   const peaksP = fetchPeaks(pos.lat, pos.lon, settings.maxDist).then(p => p, e => { S.peaksError = e; return []; });
   const r = await loadDEM(dem, pos.lat, pos.lon, settings.maxDist, (d, t) => { demP = d / t; if (token === S.loadToken) setP(); }, token);
   if (token !== S.loadToken) return;
+  S.demStats = r;
+  if (r.failed) toast(`標高データの一部(${r.failed}/${r.total}枚)を取得できませんでした。その方向の山は「判定できない」として表示から外します。`, 6000);
   if (r.total && r.failed === r.total) { S.progress = '地形データを取得できません'; renderChips(); toast('標高データを取得できませんでした。電波の状況を確認して、もう一度開いてください。', 6000); return; }
   const ground = dem.sampleFinest(pos.lat, pos.lon);
   S.ground = ground === ground ? ground : 0;
@@ -867,14 +904,17 @@ async function prepare(pos) {
     await nextFrame();
     if (token !== S.loadToken) return;
   }
-  // 画面に重ねる順番: 稜線上にある山、標高が高い山を優先
   for (const a of out) {
-    const sky = C.skyAt(pano, a.az);
-    a.onSky = a.status !== 'hidden' && a.el >= sky - 0.15 * D2R;
-    a.prio = (a.onSky ? 10000 : 0) + (a.ele || 0) - a.d * 0.004;
+    // 標高が不明・0m以下の山頂は判定に使わない
+    a.valid = a.ele >= 1 && a.status !== 'unknown';
+    a.outline = a.status === 'visible' ? C.onOutline(pano, a) : null;
+    // 画面に山名を出すのは、見えていて、空との境目か尾根の輪郭の上にある山頂だけ
+    a.label = a.valid && a.status === 'visible' && !!a.outline;
+    a.prio = (a.outline === 'sky' ? 20000 : a.outline === 'ridge' ? 10000 : 0) + a.ele - a.d * 0.004;
   }
   out.sort((a, b) => b.prio - a.prio);
   S.analyzed = out;
+  S.cands = out.filter(a => a.valid);
   S.ready = true;
   S.progress = '';
   renderChips();
@@ -1196,6 +1236,7 @@ function distColor(d, a) {
   return `rgba(${r},${g},${b},${a})`;
 }
 let lastDraw = null;
+const MAX_LABELS = 8;     // 1画面に出す山名の上限
 function drawOverlay() {
   const W = overlay.clientWidth, H = overlay.clientHeight;
   octx.clearRect(0, 0, W, H);
@@ -1268,7 +1309,7 @@ function drawOverlayInner(cam, T, W, H, pano) {
   const labels = [];
   let shown = 0;
   for (const a of S.analyzed) {
-    if (a.status === 'hidden' && !settings.showHidden) continue;
+    if (!(a.label || (settings.showHidden && a.valid))) continue;
     if (Math.abs(C.angDiff(a.az, left + span / 2)) > span / 2 + 1) continue;
     const p = cam.project(a.az, a.el); if (!p) continue;
     const s = toScr(p);
@@ -1284,7 +1325,7 @@ function drawOverlayInner(cam, T, W, H, pano) {
     const sub = Math.round(a.ele) + 'm';
     const tw = Math.max(octx.measureText(text).width, 40) + 10;
     let placed = null;
-    if (shown < 28) {
+    if (shown < MAX_LABELS) {
       for (let row = 0; row < 6; row++) {
         const by = Math.max(topLimit, s.y - 30 - row * 34);
         const box = { x: s.x - tw / 2, y: by - 30, w: tw, h: 30 };
@@ -1292,6 +1333,7 @@ function drawOverlayInner(cam, T, W, H, pano) {
       }
     }
     const isSel = S.selected && S.selected.peak === a.peak;
+    if (!placed && !isSel && a.label) continue;   // 山名を置けない山は点も出さない
     const col = a.status === 'hidden' ? 'rgba(239,138,128,.85)' : a.status === 'marginal' ? 'rgba(233,196,106,.95)' : isSel ? '#f0a35e' : '#eef2f4';
     octx.fillStyle = col;
     octx.beginPath(); octx.arc(s.x, s.y, isSel ? 4 : 2.6, 0, Math.PI * 2); octx.fill();
@@ -1353,7 +1395,7 @@ function renderChips() {
     chips.push(`<span class="chip ${u.aligned ? 'good' : 'warn'}"><b>合わせ</b>${st.align && st.align.applied && !st.manualAfterAlign ? `自動 一致${Math.round(st.align.cover * 100)}%` : st.manual ? '手動' : '未'}</span>`);
   }
   if (S.progress) chips.push(`<span class="chip"><b>準備</b>${esc(S.progress)}</span>`);
-  else if (S.ready) chips.push(`<span class="chip good"><b>山</b><span class="num">${S.analyzed.filter(a => a.status !== 'hidden').length}</span>座が見える</span>`);
+  else if (S.ready) chips.push(`<span class="chip good"><b>山</b><span class="num">${S.analyzed.filter(a => a.label).length}</span>座が見える</span>`);
   el.innerHTML = chips.join('');
 }
 
@@ -1382,11 +1424,11 @@ function showResult(forcePeak) {
   const dir = stillCamera().unproject(tap.ix, tap.iy);
   tap.az = dir.az; tap.el = dir.el;
   const T = viewTransform(st.iw, st.ih, false);
-  const tapSigma = Math.atan(12 / (st.F * T.s)) * R2D;      // 指先のずれ(約12px)を角度に換算
+  const tapSigma = Math.atan(9 / (st.F * T.s)) * R2D;       // 指先のずれ(約9px)を角度に換算
   const u = uncertainty();
   const sAz = Math.hypot(u.az, tapSigma, 0.15), sEl = Math.hypot(u.el, tapSigma, 0.15);
   const elDeg = tap.el * R2D;
-  const ranked = C.rankCandidates(S.analyzed, tap.az, elDeg, sAz, sEl);
+  const ranked = C.rankCandidates(S.cands, tap.az, elDeg, sAz, sEl);
   const j = C.judge(ranked);
   const terrain = C.terrainAt(S.dem, S.obs, S.pano.ctx, tap.az, tap.el, settings.maxDist);
   let chosen = forcePeak ? ranked.find(r => r.p.peak === forcePeak) : (j.top || null);
@@ -1396,7 +1438,7 @@ function showResult(forcePeak) {
   // 見えている地形の点に最も近い山頂
   let nearTerrain = null;
   if (terrain) {
-    for (const a of S.analyzed) {
+    for (const a of S.cands) {
       const dd = C.distBearing(terrain.lat, terrain.lon, a.peak.lat, a.peak.lon).d;
       if (dd < 2500 && (!nearTerrain || dd < nearTerrain.dd)) nearTerrain = { a, dd };
     }
@@ -1453,26 +1495,32 @@ function showResult(forcePeak) {
   reasons.push(['稜線の合わせ', u.aligned ? 'ok' : 'warn', esc(u.why) + '。',
     u.aligned ? alignDetail() : '「自動で合わせる」を押すか、白い稜線を指でずらして写真の山の形に重ねると確度が上がります。']);
 
-  const cands = ranked.slice(0, 8);
-  const candRows = cands.map(r => {
-    const reason = r.p.status === 'hidden' ? `手前の地形に隠れる(${fmtDeg(-r.p.margin * R2D, 2)})` :
-      r === (j.top) ? '最も方向が合う' : `方向が ${r.ang.toFixed(2)}° ずれる`;
-    const stTxt = { visible: '見える', marginal: 'ぎりぎり', hidden: '隠れる' }[r.p.status];
+  // 候補一覧は見えている山だけ。隠れて見えない山は件数と名前だけ添える
+  const shown = ranked.filter(r => r.p.status !== 'hidden').slice(0, 5);
+  const hiddenNear = ranked.filter(r => r.p.status === 'hidden' && r.ang < Math.max(2, 2 * sAz));
+  const candRows = shown.map(r => {
+    const reason = r === j.top ? '最も方向が合う' : r.p.status === 'marginal' ? `見えるかぎりぎり、方向が ${r.ang.toFixed(2)}° ずれる` : `方向が ${r.ang.toFixed(2)}° ずれる`;
+    const stTxt = { visible: '見える', marginal: 'ぎりぎり' }[r.p.status];
     return `<tr class="${chosen && chosen.p === r.p ? 'sel' : ''}"><td><button type="button" data-peak="${S.analyzed.indexOf(r.p)}">${esc(r.p.peak.name)}</button><br><span class="num sub" style="font-size:11px">${Math.round(r.p.ele)} m ・ ${fmtKm(r.p.d)}</span></td>
       <td><span class="st ${r.p.status}">${stTxt}</span></td><td class="num">${r.ang.toFixed(2)}°</td><td style="font-size:12px;color:var(--mist)">${reason}</td></tr>`;
   }).join('');
+  const hiddenNote = hiddenNear.length ? `<p class="sub" style="font-size:12px">この方向には、手前の地形に隠れて見えない山が ${hiddenNear.length} 座あります(${hiddenNear.slice(0, 3).map(r => esc(r.p.peak.name)).join('、')}${hiddenNear.length > 3 ? ' など' : ''})。見えないため候補から外しています。</p>` : '';
 
   const target = chosen ? { az: chosen.p.az, d: chosen.p.d, top: chosen.p.ele, name: chosen.p.peak.name, a: chosen.p }
     : terrain && !terrain.sky ? { az: tap.az, d: terrain.d, top: terrain.h, name: 'タップ地点' } : null;
-  const gsiLink = target ? (() => { const pt = chosen ? chosen.p.peak : terrain; return `https://maps.gsi.go.jp/#14/${pt.lat.toFixed(6)}/${pt.lon.toFixed(6)}/`; })() : null;
+  const gsiLink = target ? (() => { const pt = chosen ? chosen.p.peak : terrain; return `https://maps.gsi.go.jp/#13/${pt.lat.toFixed(6)}/${pt.lon.toFixed(6)}/`; })() : null;
+  const where = target ? `${chosen ? esc(chosen.p.peak.name) + 'は' : 'タップした地点は'}、あなたから見て <strong>${dirName(target.az)}(方位 ${Math.round(target.az)}°)</strong>の方向、<strong>${fmtKm(target.d)}</strong> 先にあります。` : '';
+  const ds = S.demStats;
 
   openSheet(`
     ${head}
+    ${target ? `<h3>地図(上が北)</h3><p class="where">${where}</p><div id="map" class="map-lg"></div>
+      <p class="sub" style="font-size:12px">オレンジの線が視線、薄い扇形がカメラに写っている範囲です。<a href="${gsiLink}" target="_blank" rel="noopener">地理院地図で開く</a></p>` : ''}
     <h3>判定の根拠</h3>
     <ul class="reasons">${reasons.map(([t, k, body, small]) => `<li><span class="mk ${k}">${k === 'ok' ? '✓' : k === 'warn' ? '!' : '×'}</span><div><strong>${t}</strong><br>${body}${small ? `<small>${small}</small>` : ''}</div></li>`).join('')}</ul>
     ${target ? `<h3>断面図(あなた → ${esc(target.name)})</h3><canvas class="profile" id="prof"></canvas><p class="sub" style="font-size:12px">点線は視線。地球の丸みと屈折を差し引いた高さで描いています(縦方向は強調)。</p>` : ''}
-    ${cands.length ? `<h3>近くの候補</h3><div class="cands-wrap"><table class="cands"><thead><tr><th>山名</th><th>見通し</th><th>ずれ</th><th>理由</th></tr></thead><tbody>${candRows}</tbody></table></div>` : ''}
-    ${target ? `<h3>地図</h3><div id="map"></div><p class="sub" style="font-size:12px"><a href="${gsiLink}" target="_blank" rel="noopener">地理院地図で開く</a></p>` : ''}
+    ${shown.length ? `<h3>近くの候補</h3><div class="cands-wrap"><table class="cands"><thead><tr><th>山名</th><th>見通し</th><th>ずれ</th><th>理由</th></tr></thead><tbody>${candRows}</tbody></table></div>` : ''}
+    ${hiddenNote}
     <h3>計算の条件</h3>
     <dl class="cond">
       <dt>観測地点</dt><dd class="num">${S.obs.lat.toFixed(5)}, ${S.obs.lon.toFixed(5)}(${S.pos.src === 'exif' ? '写真の位置情報' : S.pos.src === 'manual' ? '手入力' : 'GPS'}${S.pos.acc ? ` ±${Math.round(S.pos.acc)}m` : ''})</dd>
@@ -1480,8 +1528,8 @@ function showResult(forcePeak) {
       <dt>方位の出所</dt><dd>${esc(st.yawSrc)}${st.adj.yaw || st.adj.pitch ? `、補正 方位 ${fmtSigned(st.adj.yaw)}・上下 ${fmtSigned(st.adj.pitch)}` : ''}</dd>
       <dt>画角</dt><dd>${st.src === 'live' ? `ライブ設定 ${settings.liveFov}°(長辺)` : esc(st.fSrc)}${st.F !== st.F0 ? `、手動で ${(st.F / st.F0 * 100).toFixed(0)}% に調整` : ''}</dd>
       <dt>計算範囲</dt><dd>${settings.maxDist / 1000} km 以内、方位 0.1° 刻み</dd>
-      <dt>標高</dt><dd>${S.demSource.credit}(3 km以内 約8 m、25 km以内 約30 m、それ以遠 約120 m の解像度)</dd>
-      <dt>山名</dt><dd><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>${S.peaksError ? '(取得失敗)' : `(${S.peaks.length} 件)`}</dd>
+      <dt>標高</dt><dd>${S.demSource.credit}(3 km以内 約8 m、25 km以内 約30 m、それ以遠 約120 m の解像度)${ds && ds.total ? `、${ds.failed ? `<span style="color:var(--warn)">取得できなかったタイル ${ds.failed}/${ds.total} 枚</span>` : `${ds.total} 枚すべて取得`}` : ''}</dd>
+      <dt>山名</dt><dd><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>${S.peaksError ? '(取得失敗)' : `(${S.peaks.length} 件、標高が不明・0 m の ${S.analyzed.filter(a => a.ele < 1).length} 件は除外)`}</dd>
     </dl>`);
   $('#sheet').querySelectorAll('button[data-peak]').forEach(b => b.onclick = () => {
     const a = S.analyzed[+b.dataset.peak];
@@ -1489,7 +1537,7 @@ function showResult(forcePeak) {
   });
   if (target) {
     drawProfile($('#prof'), target);
-    showMap(chosen ? chosen.p : null, terrain, cands);
+    showMap({ p: chosen ? chosen.p : null, terrain, others: shown.map(r => r.p).filter(x => !chosen || x !== chosen.p), view: viewInfo() });
   }
 }
 function peakLine(p) {
@@ -1555,36 +1603,96 @@ function loadLeaflet() {
   return leafletP;
 }
 let mapInst = null;
-async function showMap(p, terrain, cands) {
-  const box = $('#map'); if (!box) return;
+/* いまカメラが向いている方位と、写っている左右の範囲[度] */
+function viewInfo() {
+  if (S.mode === 'still' && S.still) {
+    const st = S.still;
+    return { yaw: C.normAz(st.yaw0 + st.adj.yaw), hfov: 2 * Math.atan((st.iw / 2) / st.F) * R2D };
+  }
+  if (S.mode === 'live') {
+    const lc = liveCamera(); if (!lc) return null;
+    const T = viewTransform(lc.iw, lc.ih, true);
+    return { yaw: C.normAz(lc.cam.o.yaw), hfov: 2 * Math.atan((overlay.clientWidth / 2) / (lc.cam.F * T.s)) * R2D };
+  }
+  return null;
+}
+async function createMap(box) {
   let L;
-  try { L = await loadLeaflet(); } catch (e) { box.innerHTML = '<p class="sub" style="padding:12px">地図を読み込めませんでした。</p>'; return; }
-  if (!document.body.contains(box)) return;
+  try { L = await loadLeaflet(); } catch (e) { box.innerHTML = '<p class="sub" style="padding:12px">地図を読み込めませんでした。</p>'; return null; }
+  if (!document.body.contains(box)) return null;
   if (mapInst) { mapInst.remove(); mapInst = null; }
   const map = L.map(box, { zoomControl: false, attributionControl: true });
   mapInst = map;
-  L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">国土地理院</a>' }).addTo(map);
+  L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener">国土地理院</a>' }).addTo(map);
+  L.control.scale({ imperial: false, position: 'bottomleft' }).addTo(map);
+  const North = L.Control.extend({ onAdd() { const d = L.DomUtil.create('div', 'north'); d.innerHTML = '<span>N</span>▲'; return d; } });
+  new North({ position: 'topright' }).addTo(map);
+  return { L, map };
+}
+function addWedge(L, map, view, r) {
+  if (!view) return;
+  const pts = [[S.obs.lat, S.obs.lon]];
+  for (let i = 0; i <= 24; i++) { const q = C.destination(S.obs.lat, S.obs.lon, view.yaw - view.hfov / 2 + view.hfov * i / 24, r); pts.push([q.lat, q.lon]); }
+  L.polygon(pts, { color: '#d9822b', weight: 1, dashArray: '3 4', fillColor: '#f0a35e', fillOpacity: 0.13, interactive: false }).addTo(map);
+}
+function addMe(L, map) {
+  L.circleMarker([S.obs.lat, S.obs.lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#1f6feb', fillOpacity: 1 }).addTo(map)
+    .bindTooltip('あなた', { permanent: true, direction: 'bottom', className: 'tip-me' });
+}
+const peakTip = a => `${esc(a.peak.name)} <span class="tip-sub">${dirName(a.az)} ${Math.round(a.az)}° ・ ${fmtKm(a.d)}</span>`;
+async function showMap(o) {
+  const box = $('#map'); if (!box) return;
+  const m = await createMap(box); if (!m) return;
+  const { L, map } = m;
   const me = [S.obs.lat, S.obs.lon];
-  L.circleMarker(me, { radius: 6, color: '#0d1014', weight: 2, fillColor: '#f0a35e', fillOpacity: 1 }).addTo(map).bindTooltip('あなた');
   const pts = [me];
-  for (const r of cands.slice(0, 6)) {
-    if (p && r.p === p) continue;
-    const ll = [r.p.peak.lat, r.p.peak.lon];
-    L.circleMarker(ll, { radius: 4, color: r.p.status === 'hidden' ? '#ef8a80' : '#555', weight: 1.5, fillColor: '#fff', fillOpacity: .9 }).addTo(map).bindTooltip(r.p.peak.name);
+  const far = o.p ? o.p.d : o.terrain ? o.terrain.d : 5000;
+  addWedge(L, map, o.view, Math.max(3000, far * 1.15));
+  for (const a of (o.others || []).slice(0, 4)) {
+    L.circleMarker([a.peak.lat, a.peak.lon], { radius: 4, color: '#555', weight: 1.5, fillColor: '#fff', fillOpacity: 0.95 }).addTo(map).bindTooltip(esc(a.peak.name));
   }
-  if (terrain && !terrain.sky) {
-    const ll = [terrain.lat, terrain.lon];
+  if (o.terrain && !o.terrain.sky && (!o.p || C.distBearing(o.terrain.lat, o.terrain.lon, o.p.peak.lat, o.p.peak.lon).d > 1200)) {
+    const ll = [o.terrain.lat, o.terrain.lon];
     L.polyline([me, ll], { color: '#3b6ea8', weight: 2, dashArray: '4 4' }).addTo(map);
-    L.circleMarker(ll, { radius: 4, color: '#3b6ea8', fillColor: '#3b6ea8', fillOpacity: 1 }).addTo(map).bindTooltip('タップ地点の地形');
+    L.circleMarker(ll, { radius: 4, color: '#3b6ea8', fillColor: '#3b6ea8', fillOpacity: 1 }).addTo(map).bindTooltip('タップした地点の地形');
     pts.push(ll);
   }
-  if (p) {
-    const ll = [p.peak.lat, p.peak.lon];
+  if (o.p) {
+    const ll = [o.p.peak.lat, o.p.peak.lon];
     L.polyline([me, ll], { color: '#d9822b', weight: 3 }).addTo(map);
-    L.circleMarker(ll, { radius: 7, color: '#0d1014', weight: 2, fillColor: '#d9822b', fillOpacity: 1 }).addTo(map).bindTooltip(p.peak.name, { permanent: true, direction: 'top' });
+    L.circleMarker(ll, { radius: 8, color: '#fff', weight: 2, fillColor: '#d9822b', fillOpacity: 1 }).addTo(map)
+      .bindTooltip(peakTip(o.p), { permanent: true, direction: 'top', className: 'tip-peak' });
     pts.push(ll);
-    if (p.blocker) pts.push([p.blocker.lat, p.blocker.lon]);
   }
+  addMe(L, map);
+  map.fitBounds(L.latLngBounds(pts).pad(0.25));
+}
+/* いま向いている方向の俯瞰地図 */
+async function openMapView() {
+  if (!S.ready) { toast('地形と山名のデータを準備中です。完了してから開いてください。'); return; }
+  const v = viewInfo();
+  const inView = S.analyzed.filter(a => a.label && (!v || Math.abs(C.angDiff(a.az, v.yaw)) <= v.hfov / 2)).slice(0, 12);
+  const rows = inView.map(a => `<tr><td>${esc(a.peak.name)}<br><span class="num sub" style="font-size:11px">${Math.round(a.ele)} m</span></td><td class="num">${dirName(a.az)} ${Math.round(a.az)}°</td><td class="num">${fmtKm(a.d)}</td></tr>`).join('');
+  openSheet(`
+    <h2>いま向いている方向</h2>
+    <p class="sub">${v ? `${dirName(v.yaw)}(方位 ${Math.round(v.yaw)}°)を中心に幅 ${Math.round(v.hfov)}° の範囲` : '全方位'}で、見えている山 ${inView.length} 座を表示しています。</p>
+    <div id="map" class="map-lg"></div>
+    ${rows ? `<div class="cands-wrap" style="margin-top:12px"><table class="cands"><thead><tr><th>山名</th><th>方位</th><th>距離</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}`);
+  const box = $('#map');
+  const m = await createMap(box); if (!m) return;
+  const { L, map } = m;
+  const r = inView.length ? Math.max(...inView.map(a => a.d)) * 1.1 : 20000;
+  addWedge(L, map, v, r);
+  const pts = [[S.obs.lat, S.obs.lon]];
+  inView.forEach((a, i) => {
+    const ll = [a.peak.lat, a.peak.lon];
+    L.polyline([pts[0], ll], { color: '#d9822b', weight: 1, opacity: 0.45 }).addTo(map);
+    L.circleMarker(ll, { radius: 5, color: '#fff', weight: 1.5, fillColor: '#d9822b', fillOpacity: 1 }).addTo(map)
+      .bindTooltip(esc(a.peak.name), { permanent: i < 6, direction: 'top', className: 'tip-peak' });
+    pts.push(ll);
+  });
+  addMe(L, map);
+  if (v) { const q = C.destination(S.obs.lat, S.obs.lon, v.yaw, r); pts.push([q.lat, q.lon]); }
   map.fitBounds(L.latLngBounds(pts).pad(0.15));
 }
 
@@ -1701,6 +1809,7 @@ $('#btnBack').onclick = () => {
   stopLive(); stopGeo(); S.still = null; S.tap = null; show('home');
 };
 $('#btnSettings').onclick = openSettings;
+$('#btnMap').onclick = () => openMapView();
 $('#btnSettingsHome').onclick = openSettings;
 window.addEventListener('resize', () => { resizeOverlay(); });
 if (!window.isSecureContext) $('#secureBanner').hidden = false;
