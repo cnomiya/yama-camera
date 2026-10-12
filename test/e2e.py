@@ -193,8 +193,37 @@ async def main():
         await page.evaluate("document.querySelector('#sheet').scrollTop = 250")
         await page.wait_for_timeout(500)
         await page.screenshot(path=os.path.join(SP, 'shot_map2.png'))
-        # --- ライブ(偽カメラ + 方位イベント) ---
+        # --- ピンチで拡大: 画像と重ね表示が一緒に拡大され、合わせはずれない ---
         await page.click('#sheetClose')
+        await page.evaluate('''() => { window.__pinch = (x, y, d0, d1, steps = 8) => {
+          const t = document.querySelector('#overlay');
+          const ev = (type, id, px, py) => t.dispatchEvent(new PointerEvent(type, { pointerId: id, clientX: px, clientY: py, bubbles: true, pointerType: 'touch' }));
+          ev('pointerdown', 11, x - d0 / 2, y); ev('pointerdown', 12, x + d0 / 2, y);
+          for (let i = 1; i <= steps; i++) { const d = d0 + (d1 - d0) * i / steps; ev('pointermove', 11, x - d / 2, y); ev('pointermove', 12, x + d / 2, y); }
+          ev('pointerup', 11, x - d1 / 2, y); ev('pointerup', 12, x + d1 / 2, y);
+        }; }''')
+        t = next(t for t in TRUTH['truth'] if t['name'] == 'テスト岳')
+        before = await page.evaluate('({adj: {...window.__yama.S.still.adj}, F: window.__yama.S.still.F})')
+        sx, sy = await page.evaluate(f"window.__yama.imgToScreen({t['x']}, {t['y']})")
+        await page.evaluate(f'window.__pinch({sx}, {sy}, 60, 180)')
+        after = await page.evaluate('({adj: {...window.__yama.S.still.adj}, F: window.__yama.S.still.F, view: window.__yama.S.stillView})')
+        sx2, sy2 = await page.evaluate(f"window.__yama.imgToScreen({t['x']}, {t['y']})")
+        check(after['view'] and abs(after['view']['z'] - 3) < 0.05, f"2本指で約3倍に拡大 (×{after['view']['z']:.2f})" if after['view'] else '拡大されない')
+        check(after['adj'] == before['adj'] and after['F'] == before['F'], '拡大しても稜線の合わせ(方位・上下・画角)は変わらない')
+        check(abs(sx2 - sx) < 1.5 and abs(sy2 - sy) < 1.5, f'指の間にあった山頂が同じ画面位置に留まる (ずれ {abs(sx2 - sx):.2f}, {abs(sy2 - sy):.2f}px)')
+        # 拡大後の表示上で山頂の位置に重ね表示(点)が描かれている
+        px = await page.evaluate(f'''(() => {{ const c = document.querySelector('#overlay'), r = devicePixelRatio;
+          const d = c.getContext('2d').getImageData(Math.round({sx2} * r) - 3, Math.round({sy2} * r) - 3, 7, 7).data; let m = 0;
+          for (let i = 0; i < d.length; i += 4) m = Math.max(m, d[i + 3]); return m; }})()''')
+        check(px > 200, f'拡大後も山頂の位置に印が重なる (不透明度 {px})')
+        await page.screenshot(path=os.path.join(SP, 'shot_zoom.png'))
+        h2, lv = await tap_peak('テスト岳', 0)
+        check('テスト岳' in h2 and '高' in lv, f'拡大した状態でタップ → 「{h2}」{lv}')
+        await page.click('#sheetClose')
+        await page.click('#btnZoom')
+        check(await page.evaluate('window.__yama.S.stillView') is None, '「等倍に戻す」で元の表示に戻る')
+        # --- ライブ(偽カメラ + 方位イベント) ---
+        if await page.evaluate("!document.querySelector('#sheet').hidden"): await page.click('#sheetClose')
         await page.click('#btnBack')
         await page.click('#btnLive')
         await page.evaluate("""setInterval(() => { const e = new Event('deviceorientation'); Object.assign(e, {alpha: 0, beta: 90, gamma: 0, webkitCompassHeading: 255 + 7.5, webkitCompassAccuracy: 10}); window.dispatchEvent(e); }, 50)""")
@@ -203,6 +232,12 @@ async def main():
         live = await page.evaluate('({h: window.__yama.S.sensor.heading, pitch: window.__yama.S.sensor.pitch, pos: window.__yama.S.pos})')
         check(abs(live['h'] - (255 + 7.5 - 7.55)) < 0.3 and abs(live['pitch']) < 0.1, f"コンパス値(磁北)を真北に補正: {live['h']:.2f}°")
         await page.screenshot(path=os.path.join(SP, 'shot_live.png'))
+        off0 = await page.evaluate('({...window.__yama.S.liveOffset})')
+        await page.evaluate('window.__pinch(195, 420, 80, 200)')
+        lz = await page.evaluate('({z: window.__yama.S.liveZoom, tf: document.querySelector("#video").style.transform, off: {...window.__yama.S.liveOffset}})')
+        check(abs(lz['z'] - 2.5) < 0.05 and 'scale(2.5' in lz['tf'] and lz['off'] == off0, f"ライブ映像も2本指で拡大し、方位の補正は変わらない (×{lz['z']:.2f})")
+        await page.wait_for_timeout(300)
+        await page.screenshot(path=os.path.join(SP, 'shot_live_zoom.png'))
         await page.click('#btnShutter')
         await page.wait_for_timeout(1500)
         check(await page.evaluate('window.__yama.S.mode') == 'still', 'シャッターで静止画に切り替わる')

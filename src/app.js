@@ -272,6 +272,7 @@ function show(mode) {
   if (mode !== 'still') closeSheet();
   resizeOverlay();
   renderChips();
+  updateZoomUi();
 }
 function toast(msg, ms) {
   const el = $('#toast');
@@ -336,13 +337,17 @@ function freeze() {
     liveOffset: { ...S.liveOffset }, compassAcc: S.sensor.acc, manual: false, align: null, alignTried: false,
   };
   if (S.stream) S.stream.getVideoTracks().forEach(t => { t.enabled = false; });
+  // ライブで見ていた範囲(切り取り+拡大)のまま静止画にする
+  const zc = baseTransform(lc.iw, lc.ih, true).s / baseTransform(lc.iw, lc.ih, false).s * (S.liveZoom || 1);
+  S.stillView = { z: Math.min(MAX_ZOOM_STILL, zc), cx: lc.iw / 2, cy: lc.ih / 2 };
+  clampStillView();
   show('still');
   if (S.ready) autoAlignStill(true);
   return true;
 }
 function backToLive() {
   if (S.stream) S.stream.getVideoTracks().forEach(t => { t.enabled = true; });
-  S.still = null; S.tap = null;
+  S.still = null; S.tap = null; S.stillView = null;
   show('live');
 }
 
@@ -380,7 +385,7 @@ async function loadPhoto(file) {
       src: 'photo', iw, ih, F, F0: F, fSrc, yaw0, pitch0: 0, roll: 0, adj: { yaw: 0, pitch: 0 }, yawKnown, pitchKnown: false, yawSrc,
       exif, manual: false, align: null, alignTried: false, name: file.name,
     };
-    S.tap = null;
+    S.tap = null; S.stillView = null;
     show('still');
     busy(null);
     if (exif && exif.lat != null) {
@@ -426,7 +431,8 @@ function stillCamera() {
   const st = S.still;
   return C.makeCamera({ yaw: st.yaw0 + st.adj.yaw, pitch: st.pitch0 + st.adj.pitch, roll: st.roll, F: st.F, cx: st.iw / 2, cy: st.ih / 2 });
 }
-function viewTransform(iw, ih, cover) {
+/* 拡大していないときの配置。cover=ライブ(画面いっぱいに切り取り)、それ以外=写真(全体を収める) */
+function baseTransform(iw, ih, cover) {
   const W = overlay.clientWidth, H = overlay.clientHeight;
   const s = cover ? Math.max(W / iw, H / ih) : Math.min(W / iw, H / ih);
   // 根拠シートを開いているときは、写真をシートに隠れない側へ寄せる
@@ -437,6 +443,43 @@ function viewTransform(iw, ih, cover) {
   let oy = (H - ih * s) / 2;
   if (!cover && S.sheetOpen) oy = Math.min(oy, 88);
   return { s, ox: (W - iw * s) / 2, oy, W, H };
+}
+/* 拡大を含めた配置。画像・稜線・山名・タップ位置はすべてこの変換で画面に置くので、拡大してもずれない */
+const MAX_ZOOM_STILL = 8, MAX_ZOOM_LIVE = 5;
+function viewTransform(iw, ih, cover) {
+  const b = baseTransform(iw, ih, cover);
+  const Sx = b.ox + iw / 2 * b.s, Sy = b.oy + ih / 2 * b.s;     // 拡大の基準点(画像中心の画面位置)
+  if (cover) {
+    const z = S.liveZoom || 1;
+    if (z <= 1.0001) return Object.assign(b, { z: 1 });
+    const s = b.s * z;
+    return { s, ox: Sx - iw / 2 * s, oy: Sy - ih / 2 * s, W: b.W, H: b.H, z };
+  }
+  const v = S.stillView;
+  if (!v || v.z <= 1.0001) return Object.assign(b, { z: 1 });
+  const s = b.s * v.z;
+  return { s, ox: Sx - v.cx * s, oy: Sy - v.cy * s, W: b.W, H: b.H, z: v.z };
+}
+/* 拡大中に画像の外側へ動かしすぎないように制限する(画面の中央は常に画像の内側) */
+function clampStillView() {
+  const v = S.stillView, st = S.still;
+  if (!v || !st) return;
+  v.cx = Math.min(st.iw, Math.max(0, v.cx));
+  v.cy = Math.min(st.ih, Math.max(0, v.cy));
+}
+function applyLiveZoom() {
+  const z = S.liveZoom || 1;
+  video.style.transform = z > 1.0001 ? `scale(${z})` : '';
+  updateZoomUi();
+}
+function updateZoomUi() {
+  const z = S.mode === 'live' ? (S.liveZoom || 1) : S.mode === 'still' && S.stillView ? S.stillView.z : 1;
+  const b = $('#btnZoom');
+  b.hidden = !(z > 1.05) || S.mode === 'home';
+  b.textContent = `×${z.toFixed(1)} 等倍に戻す`;
+  const h = $('#hint');
+  if (S.mode === 'still') h.textContent = z > 1.05 ? '拡大中: 1本指で移動、2本指で拡大・縮小、山をタップで判定' : '山をタップすると名前と根拠を表示。2本指で拡大。稜線がずれていたら1本指でずらして合わせる';
+  else if (S.mode === 'live') h.textContent = '山をタップするか、シャッターを押すと判定します。2本指で拡大';
 }
 function drawStill() {
   // 画面いっぱいに収める(切り取らない)
@@ -1008,17 +1051,40 @@ function openSettings() {
   };
 }
 
-/* ---------- 操作(ドラッグ=合わせ、タップ=判定、2本指=画角) ---------- */
+/* ---------- 操作 ----------
+   タップ=判定、2本指=拡大・縮小(画像と重ね表示を一緒に拡大)、
+   1本指ドラッグ=拡大中は表示の移動、等倍のときは稜線の合わせ */
 const pointers = new Map();
 let gesture = null;
+const mid = () => { const [a, b] = [...pointers.values()]; return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) }; };
+function snapshotAlign() {
+  if (S.mode === 'still' && S.still) return { still: { ...S.still.adj }, manual: S.still.manual, mAfter: S.still.manualAfterAlign, live: { ...S.liveOffset } };
+  return { live: { ...S.liveOffset } };
+}
+function restoreAlign(snap) {
+  if (!snap) return;
+  if (snap.still && S.still) { S.still.adj = snap.still; S.still.manual = snap.manual; S.still.manualAfterAlign = snap.mAfter; }
+  S.liveOffset = snap.live;
+}
 $('#stage').addEventListener('pointerdown', e => {
   if (e.target.closest('button')) return;
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-  $('#stage').setPointerCapture(e.pointerId);
-  if (pointers.size === 1) gesture = { type: 'pan', x0: e.clientX, y0: e.clientY, lx: e.clientX, ly: e.clientY, t0: performance.now(), moved: false };
-  else if (pointers.size === 2 && S.mode === 'still') {
-    const [a, b] = [...pointers.values()];
-    gesture = { type: 'pinch', d0: Math.hypot(a.x - b.x, a.y - b.y), F0: S.still.F, moved: true };
+  try { $('#stage').setPointerCapture(e.pointerId); } catch (err) { /* 合成イベントなど */ }
+  if (pointers.size === 1) {
+    gesture = { type: 'pan', x0: e.clientX, y0: e.clientY, lx: e.clientX, ly: e.clientY, t0: performance.now(), moved: false, snap: snapshotAlign() };
+  } else if (pointers.size === 2) {
+    // 2本目の指が触れたら、1本目で動いてしまった合わせを取り消して拡大に切り替える
+    if (gesture && gesture.type === 'pan') restoreAlign(gesture.snap);
+    const m = mid();
+    if (S.mode === 'still' && S.still) {
+      const st = S.still;
+      if (!S.stillView) S.stillView = { z: 1, cx: st.iw / 2, cy: st.ih / 2 };
+      const T = viewTransform(st.iw, st.ih, false);
+      gesture = { type: 'pinch', d0: Math.max(10, m.d), z0: S.stillView.z, ip: { x: (m.x - T.ox) / T.s, y: (m.y - T.oy) / T.s } };
+    } else if (S.mode === 'live') {
+      gesture = { type: 'pinch', d0: Math.max(10, m.d), z0: S.liveZoom || 1 };
+    }
+    drawOverlay();
   }
 });
 $('#stage').addEventListener('pointermove', e => {
@@ -1031,10 +1097,16 @@ $('#stage').addEventListener('pointermove', e => {
     gesture.lx = e.clientX; gesture.ly = e.clientY;
     if (S.mode === 'still' && S.still) {
       const st = S.still, T = viewTransform(st.iw, st.ih, false);
-      st.adj.yaw -= Math.atan(dx / (st.F * T.s)) * R2D;
-      st.adj.pitch += Math.atan(dy / (st.F * T.s)) * R2D;
-      st.manual = true; if (st.align && st.align.applied) st.manualAfterAlign = true;
-      if (st.src === 'live') { S.liveOffset.yaw = st.liveOffset.yaw + st.adj.yaw; S.liveOffset.pitch = st.liveOffset.pitch + st.adj.pitch; }
+      if (T.z > 1.05) {
+        // 拡大中は表示を動かす
+        S.stillView.cx -= dx / T.s; S.stillView.cy -= dy / T.s;
+        clampStillView(); drawStill();
+      } else {
+        st.adj.yaw -= Math.atan(dx / (st.F * T.s)) * R2D;
+        st.adj.pitch += Math.atan(dy / (st.F * T.s)) * R2D;
+        st.manual = true; if (st.align && st.align.applied) st.manualAfterAlign = true;
+        if (st.src === 'live') { S.liveOffset.yaw = st.liveOffset.yaw + st.adj.yaw; S.liveOffset.pitch = st.liveOffset.pitch + st.adj.pitch; }
+      }
       drawOverlay();
     } else if (S.mode === 'live') {
       const lc = liveCamera(); if (!lc) return;
@@ -1043,11 +1115,21 @@ $('#stage').addEventListener('pointermove', e => {
       S.liveOffset.pitch += Math.atan(dy / (lc.cam.F * T.s)) * R2D;
     }
   } else if (gesture.type === 'pinch' && pointers.size === 2) {
-    const [a, b] = [...pointers.values()];
-    const d = Math.hypot(a.x - b.x, a.y - b.y);
-    S.still.F = Math.max(S.still.F0 * 0.6, Math.min(S.still.F0 * 1.6, gesture.F0 * d / gesture.d0));
-    S.still.manual = true;
-    drawOverlay();
+    const m = mid();
+    if (S.mode === 'still' && S.still) {
+      const st = S.still, v = S.stillView;
+      v.z = Math.max(1, Math.min(MAX_ZOOM_STILL, gesture.z0 * m.d / gesture.d0));
+      // 指の間にある画像上の点が、指の中点に留まるように中心を動かす
+      const b = baseTransform(st.iw, st.ih, false), sc = b.s * v.z;
+      const Sx = b.ox + st.iw / 2 * b.s, Sy = b.oy + st.ih / 2 * b.s;
+      v.cx = gesture.ip.x - (m.x - Sx) / sc;
+      v.cy = gesture.ip.y - (m.y - Sy) / sc;
+      clampStillView(); drawStill(); drawOverlay();
+    } else if (S.mode === 'live') {
+      S.liveZoom = Math.max(1, Math.min(MAX_ZOOM_LIVE, gesture.z0 * m.d / gesture.d0));
+      applyLiveZoom();
+    }
+    updateZoomUi();
   }
 });
 const endPointer = e => {
@@ -1055,7 +1137,13 @@ const endPointer = e => {
   pointers.delete(e.pointerId);
   if (gesture && gesture.type === 'pan' && !gesture.moved && performance.now() - gesture.t0 < 600 && e.type === 'pointerup') handleTap(e.clientX, e.clientY);
   if (gesture && gesture.type === 'pan' && gesture.moved) { renderChips(); if (S.tap && S.mode === 'still') showResult(); }
-  if (gesture && gesture.type === 'pinch' && pointers.size < 2) { renderChips(); if (S.tap) showResult(); }
+  if (gesture && gesture.type === 'pinch' && pointers.size < 2) {
+    if (S.mode === 'still' && S.stillView && S.stillView.z <= 1.02) { S.stillView = null; drawStill(); drawOverlay(); }
+    if (S.mode === 'live' && S.liveZoom <= 1.02) { S.liveZoom = 1; applyLiveZoom(); }
+    updateZoomUi();
+    gesture = pointers.size ? { type: 'none' } : null;   // 残った1本の指では何もしない
+    return;
+  }
   if (!pointers.size) gesture = null;
 };
 $('#stage').addEventListener('pointerup', endPointer);
@@ -1080,12 +1168,19 @@ $('#btnBack').onclick = () => {
 };
 $('#btnSettings').onclick = openSettings;
 $('#btnMap').onclick = () => openMapView();
+$('#btnZoom').onclick = () => {
+  if (S.mode === 'live') { S.liveZoom = 1; applyLiveZoom(); }
+  else if (S.mode === 'still') { S.stillView = null; drawStill(); drawOverlay(); }
+  updateZoomUi();
+};
+// iPhoneのSafariでページ全体が拡大されないようにする(拡大はアプリ側で行う)
+['gesturestart', 'gesturechange', 'gestureend'].forEach(t => document.addEventListener(t, e => e.preventDefault(), { passive: false }));
 $('#btnSettingsHome').onclick = openSettings;
 window.addEventListener('resize', () => { resizeOverlay(); });
 if (!window.isSecureContext) $('#secureBanner').hidden = false;
 
 // 検証用の窓口(画面からは使わない)
-window.__yama = { S, settings, prepare, handleTap, showResult, autoAlignStill, drawOverlay,
+window.__yama = { S, settings, prepare, handleTap, showResult, autoAlignStill, drawOverlay, viewTransform,
   imgToScreen: (x, y) => { const st = S.still, T = viewTransform(st.iw, st.ih, false); return [T.ox + x * T.s, T.oy + y * T.s]; } };
 show('home');
 })();
